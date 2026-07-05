@@ -1,0 +1,260 @@
+/*
+  AI Based Smart Traffic Signal Management System using ESP32
+  ---------------------------------------------------------
+  Boards library needed  : ESP32 by Espressif
+  Libraries needed       : ESP32Servo, Adafruit GFX Library, Adafruit SSD1306
+
+  LOGIC SUMMARY
+  - Roads A,B,C,D cycle in round-robin order.
+  - Each road's push button simulates a vehicle sensor.
+      -> If pressed when it is that road's turn: longer GREEN time.
+      -> If not pressed: short default GREEN time.
+  - Hold ANY single button for 1.5+ sec  -> EMERGENCY MODE for that road
+    (jumps the queue, all other roads RED, gate opens, one short beep).
+  - Press TWO OR MORE buttons together   -> ACCIDENT MODE
+    (all roads RED, gate closed, continuous buzzer, OLED shows alert).
+  - Servo acts as the barrier gate: 0 deg = closed (on RED), 90 deg = open (on GREEN).
+
+  WIRING NOTE
+  - Buttons on GPIO 32,33,34,35 are wired with EXTERNAL PULL-DOWN resistors
+    (button pressed = HIGH). GPIO 34 & 35 have no internal pull resistors,
+    so this wiring style keeps all 4 buttons consistent.
+*/
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ESP32Servo.h>
+
+// ---------- OLED ----------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET   -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ---------- Servo ----------
+Servo gateServo;
+#define SERVO_PIN 4
+
+// ---------- Buzzer ----------
+#define BUZZER_PIN 15
+
+// ---------- Road pin tables (index 0=A, 1=B, 2=C, 3=D) ----------
+const int redPins[4]    = {13, 27, 19, 2};
+const int yellowPins[4] = {12, 26, 18, 16};
+const int greenPins[4]  = {14, 25, 5, 17};
+const int buttonPins[4] = {32, 33, 34, 35};
+const char* roadNames[4] = {"A", "B", "C", "D"};
+
+// ---------- Timing ----------
+const unsigned long GREEN_TIME_VEHICLE = 5000;
+const unsigned long GREEN_TIME_DEFAULT = 2000;
+const unsigned long YELLOW_TIME        = 2000;
+const unsigned long EMERGENCY_HOLD     = 1500;   // hold time to trigger emergency
+const unsigned long EMERGENCY_GREEN    = 6000;
+const unsigned long ACCIDENT_HOLD_TIME = 8000;
+
+// ---------- State flags (set by checkForCriticalEvents) ----------
+bool accidentFlag = false;
+int  emergencyRoad = -1;
+unsigned long pressStart[4] = {0, 0, 0, 0};
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+
+  for (int i = 0; i < 4; i++) {
+    pinMode(redPins[i], OUTPUT);
+    pinMode(yellowPins[i], OUTPUT);
+    pinMode(greenPins[i], OUTPUT);
+    pinMode(buttonPins[i], INPUT);      // external pull-down assumed
+    digitalWrite(redPins[i], HIGH);
+    digitalWrite(yellowPins[i], LOW);
+    digitalWrite(greenPins[i], LOW);
+  }
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  gateServo.attach(SERVO_PIN);
+  gateServo.write(0); // closed
+
+  Wire.begin(21, 22); // SDA, SCL
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED not found");
+  }
+
+  showMessage("SMART", "TRAFFIC", "SYSTEM");
+  delay(2000);
+}
+
+// ================= MAIN LOOP =================
+void loop() {
+  for (int i = 0; i < 4; i++) {
+    checkForCriticalEvents();
+
+    if (accidentFlag) {
+      handleAccident();
+      i = -1; // restart round-robin after handling
+      continue;
+    }
+    if (emergencyRoad != -1) {
+      handleEmergency(emergencyRoad);
+      emergencyRoad = -1;
+      i = -1;
+      continue;
+    }
+
+    runRoad(i);
+  }
+}
+
+// ================= ROAD CYCLE =================
+void runRoad(int idx) {
+  bool vehicleDetected = (digitalRead(buttonPins[idx]) == HIGH);
+  unsigned long greenTime = vehicleDetected ? GREEN_TIME_VEHICLE : GREEN_TIME_DEFAULT;
+
+  allRed();
+  digitalWrite(redPins[idx], LOW);
+  digitalWrite(greenPins[idx], HIGH);
+  openGate();
+  showMessage(String("ROAD ") + roadNames[idx], "GREEN");
+
+  if (!smartDelay(greenTime)) return; // interrupted by accident/emergency
+
+  digitalWrite(greenPins[idx], LOW);
+  digitalWrite(yellowPins[idx], HIGH);
+  showMessage(String("ROAD ") + roadNames[idx], "YELLOW");
+
+  if (!smartDelay(YELLOW_TIME)) return;
+
+  digitalWrite(yellowPins[idx], LOW);
+  digitalWrite(redPins[idx], HIGH);
+  closeGate();
+}
+
+// ================= EMERGENCY =================
+void handleEmergency(int idx) {
+  allRed();
+  digitalWrite(redPins[idx], LOW);
+  digitalWrite(greenPins[idx], HIGH);
+  openGate();
+  showMessage(String("ROAD ") + roadNames[idx], "EMERGENCY");
+  beepOnce();
+
+  smartDelay(EMERGENCY_GREEN);
+
+  digitalWrite(greenPins[idx], LOW);
+  digitalWrite(redPins[idx], HIGH);
+  closeGate();
+  resetPressTimers();
+}
+
+// ================= ACCIDENT =================
+void handleAccident() {
+  int idx = firstPressedIndex();
+  if (idx == -1) idx = 0;
+
+  allRed();
+  closeGate();
+  showMessage("ACCIDENT", String("ROAD ") + roadNames[idx], "HELP SENT");
+  digitalWrite(BUZZER_PIN, HIGH);
+
+  unsigned long start = millis();
+  while (millis() - start < ACCIDENT_HOLD_TIME) {
+    delay(50);
+  }
+
+  digitalWrite(BUZZER_PIN, LOW);
+  accidentFlag = false;
+  resetPressTimers();
+}
+
+// ================= HELPERS =================
+
+// Non-blocking style delay that keeps checking for critical events.
+// Returns false if interrupted (accident/emergency detected), true if completed fully.
+bool smartDelay(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    checkForCriticalEvents();
+    if (accidentFlag || emergencyRoad != -1) {
+      // put current road's signal back to a safe state before returning
+      return false;
+    }
+    delay(50);
+  }
+  return true;
+}
+
+void checkForCriticalEvents() {
+  bool pressed[4];
+  int cnt = 0;
+
+  for (int i = 0; i < 4; i++) {
+    pressed[i] = (digitalRead(buttonPins[i]) == HIGH);
+    if (pressed[i]) cnt++;
+  }
+
+  if (cnt >= 2) {
+    accidentFlag = true;
+    return;
+  }
+
+  for (int i = 0; i < 4; i++) {
+    if (pressed[i]) {
+      if (pressStart[i] == 0) pressStart[i] = millis();
+      if (millis() - pressStart[i] > EMERGENCY_HOLD) {
+        emergencyRoad = i;
+      }
+    } else {
+      pressStart[i] = 0;
+    }
+  }
+}
+
+int firstPressedIndex() {
+  for (int i = 0; i < 4; i++) {
+    if (digitalRead(buttonPins[i]) == HIGH) return i;
+  }
+  return -1;
+}
+
+void resetPressTimers() {
+  for (int i = 0; i < 4; i++) pressStart[i] = 0;
+}
+
+void allRed() {
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(redPins[i], HIGH);
+    digitalWrite(yellowPins[i], LOW);
+    digitalWrite(greenPins[i], LOW);
+  }
+}
+
+void openGate()  { gateServo.write(90); }
+void closeGate() { gateServo.write(0);  }
+
+void beepOnce() {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(200);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+void showMessage(String line1, String line2, String line3) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+  display.println(line1);
+  display.println(line2);
+  if (line3.length() > 0) {
+    display.setTextSize(1);
+    display.println(line3);
+  }
+  display.display();
+}
+
+void showMessage(String line1, String line2) {
+  showMessage(line1, line2, "");
+}
